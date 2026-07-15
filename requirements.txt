@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+asyncpg
+pydantic[email]
+passlib[bcrypt]
+pyjwt
