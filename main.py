@@ -147,3 +147,45 @@ async def get_my_locations(
         select(models.Location).where(models.Location.user_id == current_user.id)
     )
     return result.scalars().all()
+# -------------------------------
+# 5. SERVICES
+# -------------------------------
+@app.get("/api/services", response_model=List[schemas.ServiceResponse])
+async def get_all_services(db: AsyncSession = Depends(get_db)):
+    """
+    Public endpoint to fetch all available services for the home screen.
+    Does not require a JWT token (no current_user dependency).
+    """
+    result = await db.execute(select(models.Service))
+    return result.scalars().all()
+
+@app.put("/api/workers/services")
+async def update_worker_services(
+    service_data: schemas.WorkerServiceUpdate,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Protected endpoint for workers to select which services they offer.
+    """
+    # 1. Ensure the user is actually a worker or both
+    if current_user.role == models.UserRole.customer:
+        raise HTTPException(status_code=403, detail="Customers cannot provide services")
+
+    # 2. Delete their old service list (so we can cleanly replace it)
+    await db.execute(
+        models.WorkerService.__table__.delete().where(
+            models.WorkerService.worker_id == current_user.id
+        )
+    )
+
+    # 3. Insert the new list of service IDs
+    new_services = [
+        models.WorkerService(worker_id=current_user.id, service_id=s_id) 
+        for s_id in service_data.service_ids
+    ]
+    
+    db.add_all(new_services)
+    await db.commit()
+    
+    return {"message": "Worker services updated successfully"}
