@@ -111,3 +111,39 @@ async def update_profile(
     await db.commit()
     await db.refresh(current_user)
     return current_user
+# Add this import at the top if you don't have it for returning lists
+from typing import List
+
+# -------------------------------
+# 4. LOCATIONS
+# -------------------------------
+@app.post("/api/users/locations", response_model=schemas.LocationResponse)
+async def add_location(
+    location_data: schemas.LocationCreate,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Create the new location attached to the logged-in user
+    new_location = models.Location(
+        user_id=current_user.id,
+        label=location_data.label,
+        address=location_data.address,
+        latitude=location_data.latitude,
+        longitude=location_data.longitude,
+        is_default=location_data.is_default
+    )
+    db.add(new_location)
+    await db.commit()
+    await db.refresh(new_location)
+    return new_location
+
+@app.get("/api/users/locations", response_model=List[schemas.LocationResponse])
+async def get_my_locations(
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Fetch all locations belonging to this specific user
+    result = await db.execute(
+        select(models.Location).where(models.Location.user_id == current_user.id)
+    )
+    return result.scalars().all()
