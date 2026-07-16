@@ -4,11 +4,12 @@ from sqlalchemy.future import select
 from sqlalchemy import update
 import random
 from datetime import datetime, timedelta, timezone
-
+from sqlalchemy import or_
 from database import get_db
 import models
 import schemas
 import auth
+from uuid import UUID
 
 app = FastAPI(title="Home Services API")
 
@@ -189,3 +190,103 @@ async def update_worker_services(
     await db.commit()
     
     return {"message": "Worker services updated successfully"}
+
+
+# -------------------------------
+# 6. JOBS
+# -------------------------------
+@app.post("/api/jobs", response_model=schemas.JobResponse)
+async def create_job(
+    job_data: schemas.JobCreate,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # 1. Map the validated Pydantic schema to our SQLAlchemy Database Model
+    new_job = models.Job(
+        customer_id=current_user.id, # Securely pulled from the JWT token
+        service_id=job_data.service_id,
+        description=job_data.description,
+        scheduled_time=job_data.scheduled_time,
+        
+        # Location data
+        location_id=job_data.location_id,
+        address=job_data.address,
+        latitude=job_data.latitude,
+        longitude=job_data.longitude,
+        
+        # Default starting status
+        status=models.JobStatus.requested
+    )
+    
+    # 2. Save it to the database
+    db.add(new_job)
+    await db.commit()
+    await db.refresh(new_job)
+    
+    return new_job
+
+
+@app.get("/api/jobs", response_model=List[schemas.JobResponse])
+async def get_my_jobs(
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Returns jobs belonging to the logged-in user (either as a customer or assigned worker)."""
+    if current_user.role == models.UserRole.customer:
+        # Customers see jobs they requested
+        query = select(models.Job).where(models.Job.customer_id == current_user.id)
+    else:
+        # Workers see jobs they are officially assigned to
+        query = select(models.Job).where(models.Job.worker_id == current_user.id)
+        
+    result = await db.execute(query)
+    return result.scalars().all()
+
+@app.get("/api/jobs/available", response_model=List[schemas.JobResponse])
+async def get_available_jobs(
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Workers use this to find jobs that are looking for someone."""
+    if current_user.role == models.UserRole.customer:
+        raise HTTPException(status_code=403, detail="Customers cannot view available jobs pool")
+        
+    # Find all jobs that are still 'requested' and have no worker yet
+    query = select(models.Job).where(
+        models.Job.status == models.JobStatus.requested,
+        models.Job.worker_id.is_(None)
+    )
+    result = await db.execute(query)
+    return result.scalars().all()
+
+@app.patch("/api/jobs/{job_id}/status", response_model=schemas.JobResponse)
+async def update_job_status(
+    job_id: UUID,
+    status_data: schemas.JobStatusUpdate,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Workers use this to accept a job or mark it completed."""
+    # Find the job
+    result = await db.execute(select(models.Job).where(models.Job.id == job_id))
+    job = result.scalar_one_or_none()
+    
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # If worker is accepting the job, assign them to it
+    if status_data.status == schemas.JobStatusEnum.assigned and job.status == models.JobStatus.requested:
+        if current_user.role == models.UserRole.customer:
+            raise HTTPException(status_code=403, detail="Customers cannot accept jobs")
+        job.worker_id = current_user.id
+
+    # Security check: If it's already assigned, only the assigned worker can update it
+    if job.worker_id and job.worker_id != current_user.id and current_user.role != models.UserRole.customer:
+        raise HTTPException(status_code=403, detail="You are not assigned to this job")
+
+    # Update status and save
+    job.status = status_data.status
+    await db.commit()
+    await db.refresh(job)
+    
+    return job

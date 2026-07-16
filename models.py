@@ -88,4 +88,47 @@ class Location(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     # Establish relationship back to the user
-    user = relationship("User", back_populates="locations")    
+    user = relationship("User", back_populates="locations")   
+
+class JobStatus(enum.Enum):
+    requested = "requested"       
+    assigned = "assigned"         
+    in_progress = "in_progress"   
+    completed = "completed"       
+    cancelled = "cancelled"       
+    disputed = "disputed"
+
+class Job(Base):
+    __tablename__ = "jobs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    customer_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    worker_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    service_id = Column(Integer, ForeignKey("services.id", ondelete="CASCADE"), nullable=False)
+    
+    # Text fields for job details
+    description = Column(String, nullable=True)
+    updated_description = Column(String, nullable=True) 
+    
+    # Pricing and Scheduling
+    status = Column(SQLEnum(JobStatus, name="job_status"), default=JobStatus.requested)
+    scheduled_time = Column(DateTime, nullable=True)
+    service_charge = Column(Float, nullable=True) # Maps to PostgreSQL numeric
+    final_price = Column(Float, nullable=True)
+    revision_count = Column(Integer, default=0)
+    
+    # Location details
+    location_id = Column(UUID(as_uuid=True), ForeignKey("locations.id", ondelete="SET NULL"), nullable=True)
+    address = Column(String, nullable=True)
+    latitude = Column(Float, nullable=True) # Maps to PostgreSQL double precision
+    longitude = Column(Float, nullable=True)
+    
+    # Timestamps
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+
+    # Relationships
+    customer = relationship("User", foreign_keys=[customer_id], backref="jobs_requested")
+    worker = relationship("User", foreign_keys=[worker_id], backref="jobs_assigned")
+    service = relationship("Service")
+    location = relationship("Location")
