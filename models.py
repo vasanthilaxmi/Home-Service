@@ -132,3 +132,55 @@ class Job(Base):
     worker = relationship("User", foreign_keys=[worker_id], backref="jobs_assigned")
     service = relationship("Service")
     location = relationship("Location")
+# -------------------------------
+# MODULE 3.5: JOB IMAGES & DISPUTES
+# -------------------------------
+
+class ImageType(enum.Enum):
+    before = "before"       
+    after = "after"         
+    proof = "proof"         
+
+class DisputeStatus(enum.Enum):
+    open = "open"       
+    resolved = "resolved"   
+    rejected = "rejected"   
+
+class Dispute(Base):
+    __tablename__ = "disputes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
+    raised_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    
+    reason = Column(String, nullable=False)
+    description = Column(String, nullable=False) 
+    status = Column(SQLEnum(DisputeStatus, name="dispute_status"), default=DisputeStatus.open)
+    
+    created_at = Column(DateTime, server_default=func.now())
+
+    # Relationships
+    job = relationship("Job", backref="disputes")
+    raiser = relationship("User", foreign_keys=[raised_by])    
+class UploaderType(enum.Enum):
+    worker = "worker"
+    customer = "customer"
+
+class JobImage(Base):
+    __tablename__ = "job_images"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
+    
+    image_url = Column(String, nullable=False)
+    
+    # Who uploaded it?
+    uploaded_by = Column(SQLEnum(UploaderType, name="uploader_type"), nullable=False)
+    
+    # What kind of image is it? (Using the ImageType enum we made earlier)
+    type = Column(SQLEnum(ImageType, name="image_type"), nullable=False)
+    
+    created_at = Column(DateTime, server_default=func.now())
+
+    # Relationship back to the job
+    job = relationship("Job", backref="images")    

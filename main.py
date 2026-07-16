@@ -290,3 +290,95 @@ async def update_job_status(
     await db.refresh(job)
     
     return job
+
+# -------------------------------
+# MODULE 3.5: IMAGES & DISPUTES ENDPOINTS
+# -------------------------------
+
+@app.post("/api/jobs/{job_id}/images", response_model=schemas.JobImageResponse, tags=["Jobs"])
+async def add_job_image(
+    job_id: UUID,
+    image_data: schemas.JobImageCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    """Upload a before/after/proof image for a specific job."""
+    
+    # 1. Verify the job actually exists
+    result = await db.execute(select(models.Job).where(models.Job.id == job_id))
+    job = result.scalars().first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # 2. Create and save the image record
+    new_image = models.JobImage(
+        job_id=job.id,
+        image_url=image_data.image_url,
+        uploaded_by=image_data.uploaded_by,
+        type=image_data.type
+    )
+    
+    db.add(new_image)
+    await db.commit()
+    await db.refresh(new_image)
+    
+    return new_image
+
+
+@app.post("/api/jobs/{job_id}/disputes", response_model=schemas.DisputeResponse, tags=["Jobs"])
+async def create_dispute(
+    job_id: UUID,
+    dispute_data: schemas.DisputeCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    """File a dispute for a job."""
+    
+    # 1. Verify the job exists
+    result = await db.execute(select(models.Job).where(models.Job.id == job_id))
+    job = result.scalars().first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # 2. Securely create the dispute using the logged-in user's ID
+    new_dispute = models.Dispute(
+        job_id=job.id,
+        raised_by=current_user.id,
+        reason=dispute_data.reason,
+        description=dispute_data.description,
+        status=models.DisputeStatus.open
+    )
+    
+    db.add(new_dispute)
+    await db.commit()
+    await db.refresh(new_dispute)
+    
+    return new_dispute
+@app.patch("/api/disputes/{dispute_id}/status", response_model=schemas.DisputeResponse, tags=["Jobs"])
+async def update_dispute_status(
+    dispute_id: int,
+    status_data: schemas.DisputeStatusUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
+):
+    """Admin ONLY: Update the status of an existing dispute (e.g., mark as resolved)."""
+    
+    # SECURITY CHECK: Ensure only admins can judge disputes
+    if current_user.role != "admin": 
+        raise HTTPException(status_code=403, detail="Only admins can update dispute statuses")
+
+    # 1. Find the dispute in the database
+    result = await db.execute(select(models.Dispute).where(models.Dispute.id == dispute_id))
+    dispute = result.scalars().first()
+    
+    if not dispute:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+
+    # 2. Update the status and save to database
+    dispute.status = status_data.status
+    
+    db.add(dispute)
+    await db.commit()
+    await db.refresh(dispute)
+    
+    return dispute

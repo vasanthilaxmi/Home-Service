@@ -158,3 +158,58 @@ class JobResponse(BaseModel):
 
 class JobStatusUpdate(BaseModel):
     status: JobStatusEnum
+
+
+# -------------------------------
+# MODULE 3.5: JOB IMAGES & DISPUTES SCHEMAS
+# -------------------------------
+
+class ImageTypeEnum(str, Enum):
+    before = "before"
+    after = "after"
+    proof = "proof"
+
+class UploaderTypeEnum(str, Enum):
+    worker = "worker"
+    customer = "customer"
+
+class DisputeStatusEnum(str, Enum):
+    open = "open"
+    resolved = "resolved"
+    rejected = "rejected"
+
+# --- Job Images ---
+class JobImageCreate(BaseModel):
+    image_url: str
+    uploaded_by: UploaderTypeEnum
+    type: ImageTypeEnum
+
+class JobImageResponse(BaseModel):
+    id: int
+    job_id: UUID
+    image_url: str
+    uploaded_by: UploaderTypeEnum
+    type: ImageTypeEnum
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+# --- Disputes ---
+class DisputeCreate(BaseModel):
+    reason: str
+    description: str
+
+class DisputeResponse(BaseModel):
+    id: int
+    job_id: UUID
+    raised_by: UUID
+    reason: str
+    description: str
+    status: DisputeStatusEnum
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+class DisputeStatusUpdate(BaseModel):
+    status: DisputeStatusEnum        
