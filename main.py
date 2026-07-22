@@ -10,6 +10,10 @@ import models
 import schemas
 import auth
 from uuid import UUID
+from fastapi import File, Form, UploadFile
+import magic
+import shutil # Used for saving the file locally
+import os
 
 app = FastAPI(title="Home Services API")
 
@@ -201,12 +205,15 @@ async def create_job(
     current_user: models.User = Depends(auth.get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
+    naive_scheduled_time = None
+    if job_data.scheduled_time:
+        naive_scheduled_time = job_data.scheduled_time.replace(tzinfo=None)
     # 1. Map the validated Pydantic schema to our SQLAlchemy Database Model
     new_job = models.Job(
         customer_id=current_user.id, # Securely pulled from the JWT token
         service_id=job_data.service_id,
         description=job_data.description,
-        scheduled_time=job_data.scheduled_time,
+        scheduled_time=naive_scheduled_time,
         
         # Location data
         location_id=job_data.location_id,
@@ -266,7 +273,7 @@ async def update_job_status(
     current_user: models.User = Depends(auth.get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Workers use this to accept a job or mark it completed."""
+    """Workers use this to accept a job or mark it completed. Customers can cancel requested jobs."""
     # Find the job
     result = await db.execute(select(models.Job).where(models.Job.id == job_id))
     job = result.scalar_one_or_none()
@@ -274,14 +281,58 @@ async def update_job_status(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # If worker is accepting the job, assign them to it
-    if status_data.status == schemas.JobStatusEnum.assigned and job.status == models.JobStatus.requested:
-        if current_user.role == models.UserRole.customer:
-            raise HTTPException(status_code=403, detail="Customers cannot accept jobs")
+    # Assuming job.status and status_data.status can be treated as strings
+    current_status = str(job.status.value if hasattr(job.status, 'value') else job.status)
+    new_status = str(status_data.status.value if hasattr(status_data.status, 'value') else status_data.status)
+
+    # --- CUSTOMER LOGIC ---
+    if current_user.role == models.UserRole.customer:
+        if new_status == "cancelled":
+            if current_status != "requested":
+                raise HTTPException(status_code=403, detail="Customers can only cancel jobs that are still in the 'requested' stage.")
+            
+            # Ensure we do not cancel if it has been 48 hours
+            # (Assuming job.created_at is stored in UTC)
+            if job.created_at and (datetime.utcnow() - job.created_at > timedelta(hours=48)):
+                raise HTTPException(status_code=403, detail="Cannot manually cancel the job after 48 hours.")
+
+            job.status = status_data.status
+            await db.commit()
+            await db.refresh(job)
+            return job
+        else:
+            raise HTTPException(status_code=403, detail="Customers can only cancel jobs. You cannot change the status to anything else.")
+
+    # --- WORKER LOGIC ---
+    # --- FIX 1: Worker Skill Check ---
+    if new_status == "assigned" and current_status == "requested":
+        # Check the worker_services table to ensure they offer this service
+        service_check = await db.execute(
+            select(models.WorkerService).where(
+                models.WorkerService.worker_id == current_user.id,
+                models.WorkerService.service_id == job.service_id
+            )
+        )
+        if not service_check.scalar_one_or_none():
+            raise HTTPException(status_code=403, detail="You do not offer the required service to accept this job.")
+        
         job.worker_id = current_user.id
 
+    # --- FIX 2: Strict State Machine ---
+    # Define exactly which status transitions are legally allowed
+    valid_transitions = {
+        "requested": ["assigned", "cancelled"],
+        "assigned": ["in_progress", "cancelled"],
+        "in_progress": ["completed"],
+        "completed": [], # Cannot change once completed
+        "cancelled": []  # Cannot change once cancelled
+    }
+    
+    if new_status not in valid_transitions.get(current_status, []):
+        raise HTTPException(status_code=400, detail=f"Invalid action: Cannot change job from {current_status} to {new_status}")
+
     # Security check: If it's already assigned, only the assigned worker can update it
-    if job.worker_id and job.worker_id != current_user.id and current_user.role != models.UserRole.customer:
+    if job.worker_id and job.worker_id != current_user.id:
         raise HTTPException(status_code=403, detail="You are not assigned to this job")
 
     # Update status and save
@@ -290,32 +341,74 @@ async def update_job_status(
     await db.refresh(job)
     
     return job
-
 # -------------------------------
 # MODULE 3.5: IMAGES & DISPUTES ENDPOINTS
 # -------------------------------
 
+
+
 @app.post("/api/jobs/{job_id}/images", response_model=schemas.JobImageResponse, tags=["Jobs"])
-async def add_job_image(
+async def upload_job_image(
     job_id: UUID,
-    image_data: schemas.JobImageCreate,
+    # We use File and Form here to accept multipart/form-data
+    file: UploadFile = File(...),
+    image_type: schemas.ImageTypeEnum = Form(...),
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user)
 ):
-    """Upload a before/after/proof image for a specific job."""
+    """Upload a before/after/proof image for a specific job with strict security and validation."""
     
-    # 1. Verify the job actually exists
+    # -----------------------------------------
+    # 1. VERIFY JOB & AUTHORIZATION
+    # -----------------------------------------
     result = await db.execute(select(models.Job).where(models.Job.id == job_id))
     job = result.scalars().first()
+    
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # 2. Create and save the image record
+    if current_user.id not in [job.customer_id, job.worker_id]:
+        raise HTTPException(status_code=403, detail="You are not authorized to upload images for this job.")
+
+    # Automatically determine who is uploading based on their ID
+    if current_user.id == job.customer_id:
+        uploader_type = models.UploaderTypeEnum.customer
+    else:
+       uploader_type = models.UploaderType.worker
+
+    # -----------------------------------------
+    # 2. VALIDATE REAL IMAGE (MAGIC BYTES)
+    # -----------------------------------------
+    # Read the first 2048 bytes to determine the true file signature
+    file_bytes = await file.read(2048)
+    mime_type = magic.from_buffer(file_bytes, mime=True)
+    
+    if not mime_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Invalid file type. Only real images are allowed.")
+    
+    # Reset file pointer to the beginning after reading bytes
+    await file.seek(0) 
+
+    # -----------------------------------------
+    # 3. SAVE THE FILE
+    # -----------------------------------------
+    # Ensure an upload directory exists
+    os.makedirs("uploads", exist_ok=True)
+    
+    # Create a unique file path (In production, upload this to AWS S3 or Cloudinary instead)
+    file_location = f"uploads/{job_id}_{file.filename}"
+    
+    with open(file_location, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    # -----------------------------------------
+    # 4. SAVE TO DATABASE
+    # -----------------------------------------
     new_image = models.JobImage(
         job_id=job.id,
-        image_url=image_data.image_url,
-        uploaded_by=image_data.uploaded_by,
-        type=image_data.type
+        image_url=file_location, # Save the path or S3 URL here
+        uploaded_by=uploader_type,
+        type=image_type
     )
     
     db.add(new_image)
@@ -382,3 +475,78 @@ async def update_dispute_status(
     await db.refresh(dispute)
     
     return dispute
+
+from fastapi import WebSocket, WebSocketDisconnect
+from typing import Dict
+from uuid import UUID
+
+# -------------------------------
+# MODULE 4: WEBSOCKETS (REAL-TIME)
+# -------------------------------
+
+class ConnectionManager:
+    def __init__(self):
+        # This dictionary will map a worker's UUID to their active WebSocket connection
+        self.active_workers: Dict[UUID, WebSocket] = {}
+
+    async def connect(self, websocket: WebSocket, worker_id: UUID):
+        """Accept the connection and store the worker in memory."""
+        await websocket.accept()
+        self.active_workers[worker_id] = websocket
+        print(f"Worker {worker_id} connected. Total online: {len(self.active_workers)}")
+
+    def disconnect(self, worker_id: UUID):
+        """Remove the worker when they close the app or lose signal."""
+        if worker_id in self.active_workers:
+            del self.active_workers[worker_id]
+            print(f"Worker {worker_id} disconnected.")
+
+    async def send_job_alert(self, worker_id: UUID, job_data: dict):
+        """Push a new job notification instantly to a specific worker."""
+        if worker_id in self.active_workers:
+            websocket = self.active_workers[worker_id]
+            await websocket.send_json(job_data)
+
+    async def broadcast_to_all(self, message: dict):
+        """Push a message to every single online worker."""
+        for connection in self.active_workers.values():
+            await connection.send_json(message)
+
+# Initialize a single global instance of the manager
+ws_manager = ConnectionManager()
+
+@app.websocket("/ws/workers/{worker_id}")
+async def worker_websocket_endpoint(websocket: WebSocket, worker_id: UUID):
+    # 1. Open the connection
+    await ws_manager.connect(websocket, worker_id)
+    
+    try:
+        # 2. Keep the connection open forever in a loop
+        while True:
+            # We wait for the worker's phone to send us JSON data
+            data = await websocket.receive_json()
+            
+            # 3. Check what action the phone is trying to perform
+            action = data.get("action")
+            
+            if action == "update_location":
+                lat = data.get("latitude")
+                lng = data.get("longitude")
+                
+                print(f"📍 Worker {worker_id} moved to -> Lat: {lat}, Lng: {lng}")
+                
+                # IN THE NEXT STEP: 
+                # We will route these coordinates directly to the customer 
+                # who is waiting for this specific worker!
+                
+            elif action == "accept_job":
+                # The worker tapped "Accept" on a job broadcast
+                job_id = data.get("job_id")
+                print(f"✅ Worker {worker_id} is trying to accept job {job_id}")
+                
+            else:
+                print(f"Unknown action received from {worker_id}: {data}")
+            
+    except WebSocketDisconnect:
+        # 4. If the worker closes the app, clean up their connection
+        ws_manager.disconnect(worker_id)
