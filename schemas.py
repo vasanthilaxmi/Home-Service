@@ -141,6 +141,11 @@ class JobResponse(BaseModel):
     
     status: JobStatusEnum
     scheduled_time: Optional[datetime]
+    # NEW fields
+    convenience_fee: Optional[float] = 50.0
+    is_convenience_fee_paid: Optional[bool] = False
+    worker_quote: Optional[float] = None
+
     service_charge: Optional[float]
     final_price: Optional[float]
     revision_count: int
@@ -213,3 +218,16 @@ class DisputeResponse(BaseModel):
         from_attributes = True
 class DisputeStatusUpdate(BaseModel):
     status: DisputeStatusEnum        
+from pydantic import BaseModel, Field
+
+class PriceEvaluationResponse(BaseModel):
+    is_fair: bool = Field(description="True if the customer's expected price is reasonable for the task, False if it's too low.")
+    suggested_min_price: float = Field(description="The minimum fair market price in INR.")
+    suggested_max_price: float = Field(description="The maximum fair market price in INR.")
+    reasoning: str = Field(description="A short, polite explanation of why the price is fair or unfair, written to help the customer understand.")    
+class WorkerQuoteUpdate(BaseModel):
+    worker_quote: float = Field(..., gt=0, description="The on-site price quoted by the worker in INR")
+
+class SubscriptionResponse(BaseModel):
+    message: str
+    subscription_expires_at: datetime    

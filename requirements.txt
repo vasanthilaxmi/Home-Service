@@ -5,3 +5,6 @@ asyncpg
 pydantic[email]
 passlib[bcrypt]
 pyjwt
+python-magic
+google-genai
+razorpay

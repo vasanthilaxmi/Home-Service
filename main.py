@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import BackgroundTasks, FastAPI, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import update
@@ -14,8 +14,11 @@ from fastapi import File, Form, UploadFile
 import magic
 import shutil # Used for saving the file locally
 import os
+from sqlalchemy import func, or_
+
 
 app = FastAPI(title="Home Services API")
+
 
 # -------------------------------
 # 1. SEND OTP
@@ -196,40 +199,198 @@ async def update_worker_services(
     return {"message": "Worker services updated successfully"}
 
 
+
+import asyncio
+from fastapi import BackgroundTasks, WebSocket, WebSocketDisconnect
+from sqlalchemy import or_
+
+# -------------------------------
+# 1. THE CONNECTION MANAGER
+# -------------------------------
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: dict[str, WebSocket] = {}
+
+    async def connect(self, websocket: WebSocket, worker_id: str):
+        await websocket.accept()
+        self.active_connections[worker_id] = websocket
+
+    def disconnect(self, worker_id: str):
+        if worker_id in self.active_connections:
+            del self.active_connections[worker_id]
+
+    async def send_job_notification(self, worker_id: str, job_data: dict):
+        if worker_id in self.active_connections:
+            try:
+                await self.active_connections[worker_id].send_json(job_data)
+            except Exception:
+                self.disconnect(worker_id)
+
+manager = ConnectionManager()
+
+# -------------------------------
+# 2. WEBSOCKET ENDPOINT (Workers connect here)
+# -------------------------------
+@app.websocket("/ws/workers/{worker_id}")
+async def worker_websocket_endpoint(websocket: WebSocket, worker_id: str):
+    await manager.connect(websocket, worker_id)
+    try:
+        while True:
+            # Keep the connection alive. We don't necessarily need to receive data here,
+            # just wait for the worker to disconnect.
+            data = await websocket.receive_text() 
+    except WebSocketDisconnect:
+        manager.disconnect(worker_id)
+
+
+# -------------------------------
+# 3. THE FALLBACK BACKGROUND TASK
+# -------------------------------
+async def expand_job_broadcast(job_id: UUID, cust_lat: float, cust_lon: float, db: AsyncSession):
+    """Waits 2 minutes, then broadcasts to nearby lower-rated workers."""
+    
+    # 1. Wait for the fallback timer
+    await asyncio.sleep(120)
+    
+    # 2. FETCH THE JOB (This fixes the Pylance error!)
+    result = await db.execute(select(models.Job).where(models.Job.id == job_id))
+    job = result.scalar_one_or_none()
+    
+    # If someone accepted it or it was cancelled, stop here!
+    if not job or str(job.status.value if hasattr(job.status, 'value') else job.status) != "requested":
+        return 
+
+    # 3. Setup the distance math
+    lat1 = func.radians(cust_lat)
+    lon1 = func.radians(cust_lon)
+    lat2 = func.radians(models.Location.latitude)
+    lon2 = func.radians(models.Location.longitude)
+
+    distance_expr = EARTH_RADIUS_KM * func.acos(
+        func.least(1.0, func.cos(lat1) * func.cos(lat2) * func.cos(lon2 - lon1) + func.sin(lat1) * func.sin(lat2))
+    )
+
+    # 4. Find the secondary workers (Ratings below 3.5, NOT new, but STILL within 10km)
+    secondary_workers = await db.execute(
+        select(models.WorkerProfile.user_id)
+        .join(models.Location, models.Location.user_id == models.WorkerProfile.user_id)
+        .where(
+            models.WorkerProfile.is_online == True,
+            models.WorkerProfile.is_busy == False,
+            models.Location.is_default == True,
+            distance_expr <= MAX_SEARCH_RADIUS_KM, 
+            models.WorkerProfile.rating < 3.5,
+            models.WorkerProfile.total_jobs >= 5
+        )
+    )
+    
+    # 5. Build and send the broadcast data
+    job_data = {
+        "event": "new_job_available",
+        "job_id": str(job.id),
+        "service_id": job.service_id
+    }
+    
+    for worker in secondary_workers.scalars().all():
+        await manager.send_job_notification(str(worker), job_data)
 # -------------------------------
 # 6. JOBS
 # -------------------------------
+
+
+# Add this constant near the top of your file if it isn't there already
+EARTH_RADIUS_KM = 6371.0 
+MAX_SEARCH_RADIUS_KM = 10.0 # Only ping workers within 10km
+
 @app.post("/api/jobs", response_model=schemas.JobResponse)
 async def create_job(
     job_data: schemas.JobCreate,
-    current_user: models.User = Depends(auth.get_current_user),
-    db: AsyncSession = Depends(get_db)
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user)
 ):
-    naive_scheduled_time = None
-    if job_data.scheduled_time:
-        naive_scheduled_time = job_data.scheduled_time.replace(tzinfo=None)
-    # 1. Map the validated Pydantic schema to our SQLAlchemy Database Model
+    """Customers create a job, triggering a location-based priority WebSocket broadcast."""
+    
+    # 1. Fetch the EXACT Location the customer chose in the app (Home, Office, etc.)
+    loc_result = await db.execute(
+        select(models.Location).where(
+            models.Location.id == job_data.location_id,
+            models.Location.user_id == current_user.id
+        )
+    )
+    customer_loc = loc_result.scalar_one_or_none()
+    
+    if not customer_loc:
+        raise HTTPException(status_code=400, detail="Invalid location selected.")
+
+    # 2. Save the Job to the database (Mapping ALL required fields to prevent crashes)
     new_job = models.Job(
-        customer_id=current_user.id, # Securely pulled from the JWT token
+        customer_id=current_user.id,
         service_id=job_data.service_id,
-        description=job_data.description,
-        scheduled_time=naive_scheduled_time,
-        
-        # Location data
-        location_id=job_data.location_id,
-        address=job_data.address,
-        latitude=job_data.latitude,
-        longitude=job_data.longitude,
-        
-        # Default starting status
+        description=job_data.description,         # Captured from JSON payload
+        scheduled_time=job_data.scheduled_time.replace(tzinfo=None) if job_data.scheduled_time else None,  # Captured from JSON payload
+        location_id=customer_loc.id,
+        address=customer_loc.address,             # Mapped directly from location
+        latitude=customer_loc.latitude,           # Mapped directly from location
+        longitude=customer_loc.longitude,         # Mapped directly from location
         status=models.JobStatus.requested
     )
-    
-    # 2. Save it to the database
     db.add(new_job)
     await db.commit()
     await db.refresh(new_job)
+
+    # 3. GEOSPATIAL MATH: Calculate distance directly in PostgreSQL
+    lat1 = func.radians(customer_loc.latitude)
+    lon1 = func.radians(customer_loc.longitude)
+    lat2 = func.radians(models.Location.latitude)
+    lon2 = func.radians(models.Location.longitude)
+
+    distance_expr = EARTH_RADIUS_KM * func.acos(
+        func.least(1.0, 
+            func.cos(lat1) * func.cos(lat2) * func.cos(lon2 - lon1) + 
+            func.sin(lat1) * func.sin(lat2)
+        )
+    )
+
+    # 4. Find Priority Workers (Skill + Online + Boost + WITHIN RADIUS)
+    priority_workers = await db.execute(
+        select(models.WorkerProfile.user_id)
+        .join(models.WorkerService, models.WorkerService.worker_id == models.WorkerProfile.user_id)
+        .join(models.Location, models.Location.user_id == models.WorkerProfile.user_id)
+        .where(
+            models.WorkerService.service_id == new_job.service_id,
+            models.WorkerProfile.is_online == True,
+            models.WorkerProfile.is_busy == False,
+            models.Location.is_default == True,       # Worker's active location
+            distance_expr <= MAX_SEARCH_RADIUS_KM,    # Must be within 10km!
+            or_(
+                models.WorkerProfile.rating >= 3.5,
+                models.WorkerProfile.total_jobs < 5   # New Worker Boost
+            )
+        )
+    )
+
+# 5. Broadcast to nearby Priority Workers
+    broadcast_data = {
+        "event": "new_job_available",
+        "job_id": str(new_job.id),
+        "service_id": new_job.service_id
+    }
     
+    # Extract the list of workers so we can print the count
+    workers_found = priority_workers.scalars().all()
+    
+    # Print exactly how many workers passed the SQL math
+    print(f"========== DEBUG: Found {len(workers_found)} priority workers ==========")
+    
+    for worker_id in workers_found:
+         # Print the exact message right before it gets sent
+         print(f"========== DEBUG: Sending to {worker_id}: {broadcast_data} ==========")
+         await manager.send_job_notification(str(worker_id), broadcast_data)
+
+    # 6. Start the 2-minute fallback timer
+    background_tasks.add_task(expand_job_broadcast, new_job.id, customer_loc.latitude, customer_loc.longitude, db)
+
     return new_job
 
 
@@ -307,6 +468,14 @@ async def update_job_status(
     # --- FIX 1: Worker Skill Check ---
     if new_status == "assigned" and current_status == "requested":
         # Check the worker_services table to ensure they offer this service
+        profile_check = await db.execute(
+            select(models.WorkerProfile).where(models.WorkerProfile.user_id == current_user.id)
+        )
+        worker_profile = profile_check.scalars().first()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        
+        if not worker_profile or not worker_profile.subscription_expires_at or worker_profile.subscription_expires_at < now:
+            raise HTTPException(status_code=403, detail="Active subscription (₹300/month) required to accept jobs. Please renew.")
         service_check = await db.execute(
             select(models.WorkerService).where(
                 models.WorkerService.worker_id == current_user.id,
@@ -550,3 +719,56 @@ async def worker_websocket_endpoint(websocket: WebSocket, worker_id: UUID):
     except WebSocketDisconnect:
         # 4. If the worker closes the app, clean up their connection
         ws_manager.disconnect(worker_id)
+
+
+@app.post("/api/workers/subscribe", response_model=schemas.SubscriptionResponse, tags=["Workers"])
+async def subscribe_worker(
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Worker pays ₹300/month platform fee to stay active."""
+    if current_user.role == models.UserRole.customer:
+        raise HTTPException(status_code=403, detail="Customers do not need subscriptions.")
+        
+    result = await db.execute(select(models.WorkerProfile).where(models.WorkerProfile.user_id == current_user.id))
+    profile = result.scalars().first()
+    
+    if not profile:
+        raise HTTPException(status_code=404, detail="Worker profile not found.")
+        
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if profile.subscription_expires_at and profile.subscription_expires_at > now:
+        profile.subscription_expires_at += timedelta(days=30)
+    else:
+        profile.subscription_expires_at = now + timedelta(days=30)
+        
+    await db.commit()
+    await db.refresh(profile)
+    
+    return {
+        "message": "Subscription activated successfully (₹300 paid).", 
+        "subscription_expires_at": profile.subscription_expires_at
+    }
+@app.patch("/api/jobs/{job_id}/quote", response_model=schemas.JobResponse, tags=["Jobs"])
+async def update_job_quote(
+    job_id: UUID,
+    quote_data: schemas.WorkerQuoteUpdate,
+    current_user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Worker submits the on-site price quote after evaluating the task."""
+    result = await db.execute(select(models.Job).where(models.Job.id == job_id))
+    job = result.scalars().first()
+    
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    if current_user.id != job.worker_id:
+        raise HTTPException(status_code=403, detail="Only the assigned worker can quote this job.")
+        
+    job.worker_quote = quote_data.worker_quote
+    job.final_price = quote_data.worker_quote
+    await db.commit()
+    await db.refresh(job)
+    
+    return job

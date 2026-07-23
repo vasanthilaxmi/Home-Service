@@ -35,7 +35,8 @@ class WorkerProfile(Base):
     rating = Column(Float, default=0)
     total_jobs = Column(Integer, default=0)
     last_active_at = Column(DateTime)
-
+    # NEW: 30-day platform subscription tracker
+    subscription_expires_at = Column(DateTime, nullable=True)
     user = relationship("User", back_populates="worker_profile")
 
 class OTP(Base):
@@ -113,6 +114,11 @@ class Job(Base):
     # Pricing and Scheduling
     status = Column(SQLEnum(JobStatus, name="job_status"), default=JobStatus.requested)
     scheduled_time = Column(DateTime, nullable=True)
+
+    # NEW: Two-Stage Payment Fields
+    convenience_fee = Column(Float, default=50.0)
+    is_convenience_fee_paid = Column(Boolean, default=False)
+    worker_quote = Column(Float, nullable=True)
     service_charge = Column(Float, nullable=True) # Maps to PostgreSQL numeric
     final_price = Column(Float, nullable=True)
     revision_count = Column(Integer, default=0)
